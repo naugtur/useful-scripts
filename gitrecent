@@ -1,0 +1,100 @@
+#!/bin/bash
+
+# A script to find LOCAL git branches modified in the last N days,
+# then optionally start an interactive merge process for them.
+#
+# Usage:
+#   ./git-recent-branches [days] [pattern]
+
+# --- Step 1: Find and Print Branches (The Familiar Script) ---
+
+DAYS=${1:-7}
+PATTERN=$2
+CURRENT_BRANCH=$(git branch --show-current)
+
+# Calculate the cutoff timestamp using portable shell math.
+NOW_TIMESTAMP=$(date +s)
+SECONDS_TO_SUBTRACT=$((DAYS * 86400))
+CUTOFF_TIMESTAMP=$((NOW_TIMESTAMP - SECONDS_TO_SUBTRACT))
+
+# Command pipeline to find, filter, and format branch names.
+GIT_CMD="git for-each-ref \
+    --sort=-committerdate \
+    --format='%(committerdate:unix)	%(refname:short)' \
+    refs/heads"
+
+AWK_CMD="awk -F'\t' -v cutoff=\"$CUTOFF_TIMESTAMP\" -v current_branch=\"$CURRENT_BRANCH\" '
+    \$1 > cutoff && \$2 != current_branch {
+        print \$2 # Only print the branch name
+    }
+'"
+
+# Build the filtering pipeline.
+FILTER_PIPELINE="$GIT_CMD | $AWK_CMD"
+if [ -n "$PATTERN" ]; then
+  GREP_CMD="grep --color=auto -E \"$PATTERN\""
+  FILTER_PIPELINE+=" | $GREP_CMD"
+fi
+
+# Execute the pipeline to get the list of branch names.
+BRANCH_LIST=$(eval "$FILTER_PIPELINE")
+
+# Check if any branches were found.
+if [ -z "$BRANCH_LIST" ]; then
+    echo "✅ No matching local branches found."
+    exit 0
+fi
+
+# Display the final list of branches, as requested.
+echo "Found the following branches:"
+echo "-------------------------------------"
+echo "$BRANCH_LIST"
+echo "-------------------------------------"
+
+
+# --- Step 2: Interactive Merge ---
+
+# Safety check for detached HEAD state.
+if [ -z "$CURRENT_BRANCH" ]; then
+    echo "❌ Cannot merge: You are in a 'detached HEAD' state."
+    exit 1
+fi
+
+echo
+read -p "Do you want to start merging these branches into '$CURRENT_BRANCH'? [y/N] " -n 1 -r main_reply
+echo
+
+if [[ ! "$main_reply" =~ ^[Yy]$ ]]; then
+    echo "Merge process cancelled."
+    exit 0
+fi
+
+# Iterate on the string of branch names captured above.
+for branch in $BRANCH_LIST; do
+    echo
+    read -p "Merge branch '$branch'? [y/N] " -n 1 -r reply
+    echo
+
+    if [[ "$reply" =~ ^[Yy]$ ]]; then
+        echo "Attempting to merge '$branch'..."
+        git merge "$branch"
+
+        if [ $? -ne 0 ]; then
+            echo "❌ MERGE FAILED for branch '$branch'."
+            read -p "A merge conflict likely occurred. Abort the merge? (git merge --abort) [y/N] " -n 1 -r abort_reply
+            echo
+            if [[ "$abort_reply" =~ ^[Yy]$ ]]; then
+                git merge --abort
+            fi
+            echo "Aborting further merges."
+            exit 1
+        else
+            echo "✅ Successfully merged '$branch'."
+        fi
+    else
+        echo "Skipping branch '$branch'."
+    fi
+    echo "-------------------------------------"
+done
+
+echo "🎉 Interactive merge complete."
