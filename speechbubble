@@ -4,14 +4,127 @@ set -euo pipefail
 # Configuration
 readonly DIR="${HOME}/.speechbubble"
 readonly FILE="${DIR}/rec"
+readonly CONFIG_FILE="${DIR}/config"
 readonly MAX_DURATION=300
-readonly AUDIO_INPUT='hw:0,0' # Use `arecord -l` to list available devices
 readonly MODELS_DIR="${DIR}/models"
 readonly MODEL_NAME="base.en"
 readonly CONTAINER_NAME="speechbubble"
 VERBOSE=false  # default value
 
 mkdir -p "$DIR"
+
+save_audio_config() {
+  local config="$1"
+  echo "AUDIO_CONFIG='$config'" > "$CONFIG_FILE"
+}
+
+load_audio_config() {
+  if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+    echo "$AUDIO_CONFIG"
+  else
+    echo ""
+  fi
+}
+
+test_audio_device() {
+  local device="$1"
+  local test_file="/tmp/test_audio_$$.wav"
+  
+  # Try different format/channel combinations
+  local combinations=(
+    "S16_LE 2"     # 16-bit stereo
+    "S16_LE 1"     # 16-bit mono  
+    "S32_LE 2"     # 32-bit stereo
+    "S32_LE 1"     # 32-bit mono
+  )
+  
+  for combo in "${combinations[@]}"; do
+    local format=$(echo $combo | cut -d' ' -f1)
+    local channels=$(echo $combo | cut -d' ' -f2)
+    
+    if timeout 2 arecord --device="$device" --format="$format" --rate=48000 --channels="$channels" --duration=1 "$test_file" >/dev/null 2>&1; then
+      rm -f "$test_file"
+      # Return the working configuration
+      echo "$device $format $channels"
+      return 0
+    fi
+    rm -f "$test_file"
+  done
+  
+  return 1
+}
+
+detect_audio_input() {
+  # First check if we have a saved config and if it still works
+  local saved_device
+  saved_device=$(load_audio_config)
+  
+  if [ -n "$saved_device" ]; then
+    # Parse saved config (device format channels)
+    local device=$(echo "$saved_device" | cut -d' ' -f1)
+    local format=$(echo "$saved_device" | cut -d' ' -f2)
+    local channels=$(echo "$saved_device" | cut -d' ' -f3)
+    
+    # Test the saved device configuration
+    if timeout 2 arecord --device="$device" --format="$format" --rate=48000 --channels="$channels" --duration=1 /tmp/test_audio_$$.wav >/dev/null 2>&1; then
+      rm -f /tmp/test_audio_$$.wav
+      if [ "$VERBOSE" = true ]; then
+        echo "Using saved audio device: $saved_device" >&2
+      fi
+      echo "$saved_device"
+      return 0
+    else
+      rm -f /tmp/test_audio_$$.wav
+      if [ "$VERBOSE" = true ]; then
+        echo "Saved audio device '$saved_device' no longer works, detecting new one..." >&2
+      fi
+    fi
+  fi
+  
+  # Try system default first
+  local config
+  config=$(test_audio_device "default")
+  if [ $? -eq 0 ]; then
+    save_audio_config "$config"
+    if [ "$VERBOSE" = true ]; then
+      echo "Detected and saved audio device: $config" >&2
+    fi
+    echo "$config"
+    return 0
+  fi
+  
+  # Fall back to available hardware devices
+  local devices=$(arecord -l 2>/dev/null | grep -E "^card [0-9]+:" | sed -n 's/^card \([0-9]\+\):.*device \([0-9]\+\):.*/hw:\1,\2/p')
+  
+  for device in $devices; do
+    config=$(test_audio_device "$device")
+    if [ $? -eq 0 ]; then
+      save_audio_config "$config"
+      if [ "$VERBOSE" = true ]; then
+        echo "Detected and saved audio device: $config" >&2
+      fi
+      echo "$config"
+      return 0
+    fi
+  done
+  
+  # Last resort: try common device names
+  for device in "hw:0,0" "plughw:0,0" "plughw:1,0"; do
+    config=$(test_audio_device "$device")
+    if [ $? -eq 0 ]; then
+      save_audio_config "$config"
+      if [ "$VERBOSE" = true ]; then
+        echo "Detected and saved audio device: $config" >&2
+      fi
+      echo "$config"
+      return 0
+    fi
+  done
+  
+  echo "No working audio input device found" >&2
+  return 1
+}
 
 rebuild_image() {
   echo "Building custom Docker image..."
@@ -42,9 +155,14 @@ parse_args() {
         rebuild_image
         exit 0
         ;;
+      --reset-audio)
+        rm -f "$CONFIG_FILE"
+        echo "Audio device configuration reset. Will auto-detect on next run."
+        exit 0
+        ;;
       *)
         echo "Unknown option: $1"
-        echo "Usage: $0 [-v|--verbose] [--rebuild]"
+        echo "Usage: $0 [--debug] [--rebuild] [--reset-audio]"
         exit 1
         ;;
     esac
@@ -54,6 +172,23 @@ parse_args() {
 
 start_recording() {
   echo "Started recording..."
+
+  # Detect the best available audio input device on the host
+  local audio_config
+  audio_config=$(detect_audio_input)
+  if [ $? -ne 0 ]; then
+    echo "Error: $audio_config"
+    exit 1
+  fi
+  
+  # Parse the audio configuration
+  local audio_device=$(echo "$audio_config" | cut -d' ' -f1)
+  local audio_format=$(echo "$audio_config" | cut -d' ' -f2)
+  local audio_channels=$(echo "$audio_config" | cut -d' ' -f3)
+  
+  if [ "$VERBOSE" = true ]; then
+    echo "Using audio device: $audio_device, format: $audio_format, channels: $audio_channels"
+  fi
 
   input_name=$(basename "$FILE.wav")
   
@@ -68,7 +203,7 @@ start_recording() {
     --network none \
     -v "$(dirname "$FILE"):/data" \
     speechbubble:latest \
-    "arecord --device=$AUDIO_INPUT --format=S16_LE --rate=48000 --channels=2 --duration=$MAX_DURATION /data/$input_name"
+    "arecord --device=$audio_device --format=$audio_format --rate=48000 --channels=$audio_channels --duration=$MAX_DURATION /data/$input_name"
 }
 
 stop_recording() {

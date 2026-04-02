@@ -1,0 +1,6 @@
+#!/bin/sh
+
+git checkout -b backup/$(git rev-parse --abbrev-ref HEAD)
+git fetch origin
+git switch -
+git reset --hard origin/$(git rev-parse --abbrev-ref HEAD)

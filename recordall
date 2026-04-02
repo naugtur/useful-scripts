@@ -1,0 +1,71 @@
+#!/bin/bash
+set -euo pipefail
+
+# recordall - Record microphone and system audio simultaneously as separate files
+# Requires: ffmpeg, pulseaudio-utils (pactl)
+# Usage: recordall [output_directory]
+
+OUTPUT_DIR="${1:-.}"
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+MIC_FILE="${OUTPUT_DIR}/mic-${TIMESTAMP}.wav"
+SYS_FILE="${OUTPUT_DIR}/system-${TIMESTAMP}.wav"
+
+# Check dependencies
+for cmd in ffmpeg pactl; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "Error: '$cmd' is not installed." >&2
+        exit 1
+    fi
+done
+
+# Auto-detect the PulseAudio/PipeWire monitor source for system audio
+DEFAULT_SINK="$(pactl info 2>/dev/null | grep 'Default Sink:' | cut -d' ' -f3)"
+if [ -z "$DEFAULT_SINK" ]; then
+    echo "Error: Could not determine default audio output sink." >&2
+    echo "Is PulseAudio or PipeWire running?" >&2
+    exit 1
+fi
+MONITOR_SOURCE="${DEFAULT_SINK}.monitor"
+
+# Verify the monitor source exists
+if ! pactl list short sources 2>/dev/null | grep -q "$MONITOR_SOURCE"; then
+    echo "Error: Monitor source '${MONITOR_SOURCE}' not found." >&2
+    echo "Available sources:" >&2
+    pactl list short sources >&2
+    exit 1
+fi
+
+mkdir -p "$OUTPUT_DIR"
+
+echo "Recording started at $(date +%H:%M:%S)"
+echo "  Microphone -> ${MIC_FILE}"
+echo "  System audio (${MONITOR_SOURCE}) -> ${SYS_FILE}"
+echo "Press Ctrl+C to stop."
+echo
+
+cleanup() {
+    echo
+    echo "Stopping recording..."
+    # Kill both ffmpeg processes
+    [ -n "${MIC_PID:-}" ] && kill "$MIC_PID" 2>/dev/null && wait "$MIC_PID" 2>/dev/null
+    [ -n "${SYS_PID:-}" ] && kill "$SYS_PID" 2>/dev/null && wait "$SYS_PID" 2>/dev/null
+    echo "Saved:"
+    [ -f "$MIC_FILE" ] && echo "  Microphone:    ${MIC_FILE} ($(du -h "$MIC_FILE" | cut -f1))"
+    [ -f "$SYS_FILE" ] && echo "  System audio:  ${SYS_FILE} ($(du -h "$SYS_FILE" | cut -f1))"
+}
+trap cleanup INT TERM
+
+# Record microphone (default PulseAudio source)
+ffmpeg -hide_banner -loglevel error -f pulse -i default \
+    -ac 1 -ar 48000 "$MIC_FILE" &
+MIC_PID=$!
+
+# Record system audio (monitor of default sink)
+ffmpeg -hide_banner -loglevel error -f pulse -i "$MONITOR_SOURCE" \
+    -ac 2 -ar 48000 "$SYS_FILE" &
+SYS_PID=$!
+
+# Wait for either process to exit (or Ctrl+C)
+wait -n "$MIC_PID" "$SYS_PID" 2>/dev/null || true
+cleanup
+
